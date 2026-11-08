@@ -4,7 +4,7 @@ This project made a 0.8B-parameter language model better at fixing code as an ag
 
 - Model: Qwen3.5-0.8B
 - Hardware: one Apple M2 with 16 GB of shared memory; no cloud GPUs
-- Built: 4 to 7 November 2026
+
 
 ## Results
 
