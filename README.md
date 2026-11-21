@@ -4,7 +4,7 @@
 
 The edit doesn't teach the model new math. It stops the model from looping, so it finishes answers it could already work out. Mechanically, the edit is a constant vector added to the network, written through the most constant channel in each of the first three layers.
 
-Paper: [`paper/paper.pdf`](paper/paper.pdf) (LaTeX source: [`paper/main.tex`](paper/main.tex)). arXiv link: to be added once it's listed.
+
 
 ## The problem
 
@@ -66,34 +66,6 @@ The Astra edit is [public](https://huggingface.co/RikiyaT/Qwen3.5-0.8B-weight-sp
 | MATH-500, thinking 4k | 41.0–46.8% | 18.6% / 19.2% |
 
 The comparison is **not** on their protocol. Their results use 32,768 tokens and a presence penalty of 1.5; ours use 4k–8k tokens and no penalty, and at those budgets their edit rarely finishes. We never ran their protocol, so we don't claim ours is better there. Stacking both edits adds nothing over ours alone.
-
-## Reproduce
-
-These scripts need a [Modal](https://modal.com) account (A100-40GB). Set `MODAL_PROFILE` to your profile. The whole project, including failed and unrelated runs, cost about $30 of cloud credit.
-
-```sh
-# 1. the model's own answers to MATH train, 4 per problem, thinking off
-python scripts/cloud_eval.py --task mathtrain --k 4 --temperature 0.7 --top-p 0.8 --top-k 20 \
-  --max-new-tokens 1536 --out results/a100_base_mathtrain_k4.jsonl
-python scripts/build_sft.py results/a100_base_mathtrain_k4.jsonl --per-problem 2
-
-# 2. train a sparse edit (gradient-chosen weights), e.g. 140 weights
-python scripts/cloud_train.py --name mini-k140 --data data/sft/a100_base_mathtrain_k4_think.jsonl \
-  --method sparse --k 140 --lr 3e-4
-#    controls: --select random   |   only chosen columns: --select columns --columns '{"<module>": [cols]}'
-
-# 3. evaluate (thinking on at 4k, two seeds) and build the report
-python scripts/cloud_suite.py --model mini-k140 --only math500_think4k,math500_think4k_s1
-python scripts/report_edits.py
-
-# mechanism and comparison
-python scripts/channel_variants.py --build   # ablations of the 1,398-weight edit
-python scripts/compare_astra.py              # Astra diff vs our edit (fetches 2 tensors, runs locally)
-python scripts/probe_run.py && python scripts/probe_report.py
-python scripts/bias_run.py                   # the "3 fixed vectors" test
-```
-
-The edit files are small: [`results/edits/`](results/edits/) holds the 140-, 500-, 1,398- and 4-column edits (10–50 KB each).
 
 ## Also in this repo: coding adapters that didn't transfer
 
