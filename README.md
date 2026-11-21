@@ -1,89 +1,165 @@
-# Weight Engineering
+# A Bias in Disguise: tiny gradient edits that stop a small model's thinking loops
 
-This project made a 0.8B-parameter language model better at fixing code as an agent. All of the work ran on one 16 GB laptop.
+**Changing 140 of the 873 million weights in Qwen3.5-0.8B takes its thinking-mode MATH-500 score from 15% to 39%.** Changing 1,398 weights takes it to 43%. Training takes 2–9 minutes on one GPU, and 50 of the model's own answers are enough data.
 
-- Model: Qwen3.5-0.8B
-- Hardware: one Apple M2 with 16 GB of shared memory; no cloud GPUs
+The edit doesn't teach the model new math. It stops the model from looping, so it finishes answers it could already work out. Mechanically, the edit is a constant vector added to the network, written through the most constant channel in each of the first three layers.
 
+Paper: [`paper/paper.pdf`](paper/paper.pdf) (LaTeX source: [`paper/main.tex`](paper/main.tex)). arXiv link: to be added once it's listed.
+
+## The problem
+
+With thinking on, Qwen3.5-0.8B almost never stops reasoning. At a 4,096-token budget on MATH-500, only 1 of 500 answers closes its `</think>` block; the rest repeat themselves until they run out of tokens. It scores 15.4% this way, against 41.0% with thinking turned off.
+
+In November 2026, [Sparks of Weight-Space Programming](https://rikiyat.github.io/blog/weight-space-programming/) (MIT CSAIL) had GPT-6 Astra read this model's weights and edit 131,072 of them by hand, with no gradients. MATH-500 rose from 7.9% to 48.1%. Nobody had checked what ordinary gradient descent does on the same problem. This repo does.
+
+## What we did
+
+1. **Data from the model itself.** The base model answers MATH *training* problems with thinking off. We keep its correct, finished answers and rewrite them in thinking format: the reasoning, then `</think>`, then a one-line final answer. No test problems, and no other model.
+2. **Choose which weights may change.** We measure how strongly each weight's gradient pulls on that data, and keep only the top *k* weights across the whole model (140 to 139,750 of them).
+3. **Train only those weights**, then write them back into the original checkpoint. We count how many bf16 values actually changed.
+4. **Test against controls.** We compare with random weights of the same count, a dense LoRA, and the base model with thinking off. Paired significance tests are run on the same problems.
 
 ## Results
 
-The best checkpoint is a LoRA adapter called v3. Every run used greedy decoding with thinking off, on the same fixed test sets. Each p-value comes from a two-sided paired sign test against the base model, counted over the items where the two models disagree.
+MATH-500 with thinking on, 4,096 tokens, mean of two samples:
 
-| Benchmark | Base | v3 | Change | p |
-|---|---|---|---|---|
-| Agent bug-fixing (40 tasks) | 9/40 (22.5%) | 20/40 (50.0%) | 2.2x | 0.007 |
-| Agent, all tasks (80) | 19/80 (23.8%) | 30/80 (37.5%) | +13.7 points | 0.027 |
-| Agent implementation (40) | 25.0% | 25.0% | none | 1.0 |
-| HumanEval, single-shot (164) | 33.5% | 34.8% | +1.3 points | 0.85 |
-| MATH-500 (first 100) | 40% | 39% | -1 point | 1.0 |
+| Edit | Weights changed | Accuracy | Answers that finished thinking (of 500) |
+|---|---|---|---|
+| None (base model) | 0 | 15.4% | 1–2 |
+| Gradient-chosen | 140 | 39.0% | ~280 |
+| Gradient-chosen | 1,398 | 42.9% | ~342 |
+| Gradient-chosen | 139,750 | 45.5% (48.0% at 8k tokens) | ~356 |
+| Random positions (control) | 1,398 | 16.3% | 2–3 |
+| Random positions (control) | 139,750 | 43.4% | ~345 |
+| Dense LoRA, rank 16 | 409M | 41.0% | 345 |
+| Base model, **thinking off** (greedy) | 0 | 41.0% | n/a |
 
-The fine-tuned model solves more than twice as many agent bug-fixing tasks as the base model. In a successful run it searches its memory, reads the failing test and the code, runs the code, fixes the bug and runs the test again. It gained this skill without losing single-shot coding ability; the first attempt, v1, lost about 10 points there.
+- **Small and cheap.** 140 weights recover most of the gap. Training 1,398 weights on just 50 examples (1.9 minutes) gives 39.6%.
+- **Which weights matter at small sizes.** At 1,398 weights, random positions do nothing. At the size of the Astra edit, random positions work too, so 0.016% of the weights is a generous budget for this fix.
+- **It's a loop fix, not new skill.** Every problem an edit fixed was one the base model never finished. The edited model roughly matches the base model with thinking off; it beats it only at 8k tokens (48.0% vs 41.0%, p = 0.002).
+- **Transfer.** It carries over to GSM8K, which it never trained on (13.6% → 56.1% with thinking on). It does not carry over to code.
 
-The agent benchmark is built from HumanEval, which was never used for training. The full official HumanEval tests grade each task, and the agent never sees them.
+All runs, with paired tests: [`results/EDITS_REPORT.md`](results/EDITS_REPORT.md).
 
-### Inference settings alone
+## Why it works: a bias in disguise
 
-Before any training, changing only the decoding settings tripled MATH accuracy with the same weights:
+The gradient puts most of the edit on four input columns of `linear_attn.out_proj` in layers 0–2. Each of these is **the single most constant channel in its layer**; layer 2's sits at −2.69 with a standard deviation of only 0.067.
 
-| Setting | MATH-500 (100) | HumanEval (164) |
+Qwen3.5 has no bias terms. Changing how an always-on channel writes into the network therefore adds nearly the same vector at every position: it's a bias in disguise.
+
+| Test | MATH-500, thinking 4k |
+|---|---|
+| Train only those 4 columns (4,096 weights) | 45.8% / 44.0% |
+| Train 4 random columns in the same matrices | 20.4% / 20.6% |
+| Base model + 3 fixed vectors added by hand, no weight change (96 problems) | 45.8% (edit: 42.7%, base: 11.5%) |
+| All 3 vectors packed into a single column | 21.2% / 20.4% (fails: placement matters) |
+
+## Compared with the GPT-6 Astra edit
+
+The Astra edit is [public](https://huggingface.co/RikiyaT/Qwen3.5-0.8B-weight-space-programming), and we ran it through our evaluation. It works differently from ours:
+
+| | Our edit | Astra edit |
 |---|---|---|
-| Model-card sampling, thinking on | 13% | not run |
-| Model-card sampling, thinking off | 27% | 18.3% |
-| Greedy, thinking off | 40% | 33.5% |
+| Found by | Gradient descent, minutes on one GPU | GPT-6 Astra reading the weights, no gradients |
+| Where | Layers 0–2, linear-attention output | Layers 15 and 19, MLP output |
+| What it does | Adds a near-constant vector | Flips one direction, multiplied by −5 on 64 columns per layer; the effect depends on the input |
+| MATH-500, thinking 4k | 41.0–46.8% | 18.6% / 19.2% |
 
-With thinking on, the model never closed its reasoning block. All 100 MATH answers hit the 4,096-token limit, with an average of 23 "Wait"s each. The thinking-off runs scored higher even though their limits were smaller: 2,048 tokens for MATH and 1,024 for HumanEval.
+The comparison is **not** on their protocol. Their results use 32,768 tokens and a presence penalty of 1.5; ours use 4k–8k tokens and no penalty, and at those budgets their edit rarely finishes. We never ran their protocol, so we don't claim ours is better there. Stacking both edits adds nothing over ours alone.
 
-### Adapter strength trades one skill for another
+## Reproduce
 
-These rows score a single adapter, v1, with its update scaled at load time. Scale 0 is the base model.
+These scripts need a [Modal](https://modal.com) account (A100-40GB). Set `MODAL_PROFILE` to your profile. The whole project, including failed and unrelated runs, cost about $30 of cloud credit.
 
-| v1 scale | 0 | 0.25 | 0.5 | 0.75 | 1.0 |
-|---|---|---|---|---|---|
-| HumanEval | 33.5% | 32.3% | 28.0% | 26.2% | 23.2% |
-| MATH-500 | 40% | 42% | 49% | 43% | 44% |
-| Agent (80) | 23.8% | - | 26.3% | - | 37.5% |
+```sh
+# 1. the model's own answers to MATH train, 4 per problem, thinking off
+python scripts/cloud_eval.py --task mathtrain --k 4 --temperature 0.7 --top-p 0.8 --top-k 20 \
+  --max-new-tokens 1536 --out results/a100_base_mathtrain_k4.jsonl
+python scripts/build_sft.py results/a100_base_mathtrain_k4.jsonl --per-problem 2
 
-At half strength, MATH reached 49%, the highest MATH score in the project. That is 9 points above the base model, but the difference is not significant (p = 0.12).
+# 2. train a sparse edit (gradient-chosen weights), e.g. 140 weights
+python scripts/cloud_train.py --name mini-k140 --data data/sft/a100_base_mathtrain_k4_think.jsonl \
+  --method sparse --k 140 --lr 3e-4
+#    controls: --select random   |   only chosen columns: --select columns --columns '{"<module>": [cols]}'
 
-## The weight edit
+# 3. evaluate (thinking on at 4k, two seeds) and build the report
+python scripts/cloud_suite.py --model mini-k140 --only math500_think4k,math500_think4k_s1
+python scripts/report_edits.py
 
-The project began as a reproduction of "Sparks of Weight-Space Programming" (MIT CSAIL, November 2026). That method changes a small number of MLP weights directly instead of training the model.
+# mechanism and comparison
+python scripts/channel_variants.py --build   # ablations of the 1,398-weight edit
+python scripts/compare_astra.py              # Astra diff vs our edit (fetches 2 tensors, runs locally)
+python scripts/probe_run.py && python scripts/probe_report.py
+python scripts/bias_run.py                   # the "3 fixed vectors" test
+```
 
-- **Finding the direction.** I looked for a "self-doubt" direction: the direction in the MLP output that appears just before the model writes "Wait". The comparison had to use matched control tokens. Without them it produced a false signal, even at layer 0.
-- **The edit.** The direction was removed from 64 down_proj columns in each of layers 14 and 16. That changes 131,072 weights, under 0.02% of the model, and the edit is stored as a 264 KB patch file instead of a full model copy.
-- **Effect on doubt.** On 24 MATH problems, "Wait"s per answer fell from 23.8 to 11.7 (-51%). At double strength they fell to 2.5 (-89%).
-- **Effect on accuracy.** Accuracy stayed at 4/24, because the model kept doubting in other words. Adding layer 22 broke the model: it averaged 142 "Wait"s per answer. A broader edit, targeting doubt versus commitment, dropped accuracy to 0/24.
+The edit files are small: [`results/edits/`](results/edits/) holds the 140-, 500-, 1,398- and 4-column edits (10–50 KB each).
 
-The edit gave precise control over what the model wrote, but in this setting it did not make the model more accurate. The project therefore moved to fine-tuning.
+## Also in this repo: coding adapters that didn't transfer
 
-## How it was built
+Before the thinking-mode work, we fine-tuned LoRA adapters on the Mac (MLX) to make the model better at coding and agent tasks. They improved our own development tasks a lot: the agent's bug-fix rate went from 22.5% to 57.5%. **None of that held up on public held-out benchmarks.** We report it because negative results are useful.
 
-1. **Baseline.** I measured MATH-500, HumanEval and a small agent suite, and found that the model's thinking never ended.
-2. **Weight edits.** Described above: precise control over the model's wording, but no accuracy gain.
-3. **Inference.** Turning thinking off and decoding greedily gave the largest gain that required no training.
-4. **Data.** The training set has 1,401 examples, none taken from the test sets.
-   - **Self-taught answers.** For each problem, the model's shortest attempt that was verified correct: 759 from 2,000 MATH training problems and 372 from 974 MBPP problems. Code was checked by running its tests, and math answers with math-verify. Keeping the shortest correct answer works directly against the model's habit of rambling.
-   - **Authored agent runs.** Claude acted as the agent inside the same harness the small model uses. Every tool call ran for real, and a run was kept only if the hidden tests passed. There are 270 runs:
-     - 100 bug fixes;
-     - 100 implementations;
-     - 70 sessions from two-session projects, where the second session can only succeed by reading notes saved in the first;
-     - of all these, 42 also show recovery from a deliberately wrong first attempt.
-5. **Training.** The standard trainer, `mlx_lm lora`, runs out of memory on this model, so I wrote a custom training loop with three changes:
-   - The linear-attention layers use a chunked gated-delta recurrence (`wsp/chunked_delta.py`). It replaces a per-token loop that needs more than 10 GB of autograd state per layer at 2,500 tokens. Its outputs, final state and gradients were checked against the reference implementation.
-   - Logits over the 248k-token vocabulary are computed only at positions that are trained on.
-   - All the assistant turns in an agent run train in a single pass. The loss is the same as training one example per turn, at one sixth of the compute.
+| Benchmark (held out) | Base | v4 adapter |
+|---|---|---|
+| HumanEval+ | 28.7% | 28.7% |
+| HumanEvalFix, single reply | 8.5% | 3.0% (significantly worse) |
+| HumanEvalFix, as agent tasks | 13.4% | 14.6% |
+| LiveCodeBench v6 | 8.6% | 6.9% |
+| GSM8K | 56.0% | 56.3% |
+| MATH-500 | 41.8% | 42.6% |
 
-   Training peaked at 4.9 GB of memory. The LoRA adapter has rank 16 across all 24 layers, with 10.8M trainable parameters, trained for 666 steps over 2 epochs.
-6. **Iteration.**
-   - v1 (peak learning rate 2e-5) raised the agent score from 23.8% to 37.5%. Single-shot HumanEval fell from 33.5% to 23.2% (p = 0.01).
-   - v2 used new data at the same learning rate and was worse on every measure: HumanEval 17.7%, MATH 34%, agent 32.5%.
-   - The diagnosis was that the update was too large. The earliest checkpoints were the worst (v2 at step 111 scored 7.9% on HumanEval), and scaling the v1 update down brought coding ability back.
-   - v3 trained on the v1 data with a 4x lower peak learning rate (5e-6) and a longer warmup. It kept the full agent gain and lost no coding ability.
+The adapter learned the *form* of the agent workflow: it calls `finish` and never edits test files. It did not learn the substance: in 105 of its 109 wrong `finish` calls, the last test had just failed. Its development-set gains came from bugs made the same way as its training bugs. The full tables are in [`results/REPORT.md`](results/REPORT.md).
 
-## Limitations
+An earlier attempt to copy the Astra approach by hand also failed. We removed a "Wait"/self-doubt direction from the model; that halved the number of "Wait"s, but the model just doubted in other words and accuracy didn't change (`scripts/wait_direction.py`).
 
-- Implementation tasks did not improve (25% before and after), and v3 does not improve MATH.
-- v3 edits the visible test file in 9 of the 80 agent tasks; the base model does so in 1. Separate hidden tests do the grading, so these edits cannot raise the score, but the habit is unwanted.
-- On the 6 hand-made agent tasks, the base model and v1 both scored 0/6. v3 was not run on them.
-- Each configuration was trained once, with one seed, and the test sets have 80 to 164 items. Differences smaller than about 10 points are within noise.
+### Try the adapters locally (MLX, Apple silicon)
+
+Turn thinking off and use temperature 0; that's how the adapters were trained and evaluated.
+
+```sh
+source .venv/bin/activate
+python -m mlx_lm generate --model Qwen/Qwen3.5-0.8B --adapter-path adapters/v4 \
+  --chat-template-config '{"enable_thinking": false}' --temp 0 --max-tokens 1024 --prompt "..."
+# coding agent on a folder (it edits files and runs shell commands there: use a COPY)
+python agent/harness.py "The tests in test_x.py fail. Fix x.py." --workspace /path/to/copy \
+  --project myproj --adapter adapters/v4 --max-steps 15
+# OpenAI-compatible server at http://localhost:8080/v1
+python -m mlx_lm server --model models/qwen3.5-0.8b-v4 --temp 0 \
+  --chat-template-args '{"enable_thinking": false}'
+```
+
+MBPP and the MATH training split were used for training, so scores on them aren't a fair test. HumanEval, MATH-500 and the HumanEval agent tasks were never trained on.
+
+## Layout
+
+| Path | What it is |
+|---|---|
+| `paper/` | The paper: LaTeX source and PDF |
+| `cloud/gen.py` | vLLM generation on a Modal GPU (base model, our checkpoints, or any Hugging Face repo) |
+| `cloud/train.py` | Sparse edits (gradient, random or chosen columns) and LoRA, merged into the original checkpoint |
+| `cloud/edit.py` | Checkpoints built from part of an existing edit (ablations, one-column edit) |
+| `cloud/probe.py` | Activation probe and the bias-equivalence test |
+| `scripts/cloud_eval.py`, `scripts/cloud_suite.py` | Evaluations on Modal, graded locally |
+| `scripts/cloud_train.py`, `scripts/build_sft.py` | Training data and training on Modal |
+| `scripts/compare_astra.py`, `scripts/probe_run.py`, `scripts/probe_report.py`, `scripts/bias_run.py` | Mechanism analysis |
+| `scripts/report_edits.py` → `results/EDITS_REPORT.md` | All weight-edit results with paired tests |
+| `scripts/report.py` → `results/REPORT.md` | Held-out results for the coding adapters |
+| `scripts/compare.py`, `scripts/fixed_analysis.py` | Paired tests between two result files |
+| `wsp/evals/` | Graders: MATH (math-verify), GSM8K, HumanEval, HumanEvalFix, LiveCodeBench |
+| `wsp/mlx_backend.py`, `scripts/train.py`, `wsp/chunked_delta.py` | Local MLX generation and memory-safe LoRA training on a 16 GB Mac |
+| `agent/` | The coding agent (files, shell, memory tools), its tasks and its evaluation |
+| `results/edits/` | The sparse edit files |
+
+## Known quirks
+
+- **Missing generation config.** The model repo ships no `generation_config.json`, so torch stops only on `<|endoftext|>` and MLX only on `<|im_end|>`. Both backends here add the missing stop token; without it the model invents tool responses.
+- **`</think>` is not a special token.** Count an answer as finished only if it ends normally *and* contains `</think>`. Graders can find a correct-looking number inside an unfinished trace.
+- **Batched greedy decoding is not reproducible.** Batch composition changes the bf16 numerics. The same 100 MATH problems scored 40% in one run and 47% in another, so small evals can't detect gains of a few points.
+- **`mlx_lm lora` runs out of memory on this model.** `scripts/train.py` uses a chunked linear-attention recurrence (`wsp/chunked_delta.py`) and computes logits only where needed; peak memory is about 4.8 GB.
+- **math-verify fails in worker threads.** Its timeout uses `signal.alarm`, so in a worker thread it marks every answer wrong. Grade math on the main thread.
+- **One model job at a time on a 16 GB Mac.** Start long local jobs with `nohup caffeinate -i ...` so the Mac doesn't sleep.
+- **The agent's `run` tool is not a sandbox.** Use it only on throwaway copies.
+
+## Acknowledgments
+
+Experiment code and drafting were assisted by Claude (Anthropic). The author designed the study, checked the results and takes responsibility for the content. Base model: [Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) (Apache-2.0).
